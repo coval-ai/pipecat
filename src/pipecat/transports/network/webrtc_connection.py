@@ -7,7 +7,7 @@
 import asyncio
 import json
 import time
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 from av.frame import Frame
 from loguru import logger
@@ -49,8 +49,8 @@ class PeerLeftMessage(BaseModel):
 
 
 class SignallingMessage:
-    Inbound = Union[TrackStatusMessage]  # in case we need to add new messages in the future
-    outbound = Union[RenegotiateMessage]
+    Inbound = Union[TrackStatusMessage, RenegotiateMessage, PeerLeftMessage]  # in case we need to add new messages in the future
+    outbound = Union[RenegotiateMessage, PeerLeftMessage]
 
 
 class SmallWebRTCTrack:
@@ -87,27 +87,22 @@ class SmallWebRTCTrack:
         return getattr(self._track, name)
 
 
-# Alias so we don't need to expose RTCIceServer
-IceServer = RTCIceServer
-
-
 class SmallWebRTCConnection(BaseObject):
-    def __init__(self, ice_servers: Optional[Union[List[str], List[IceServer]]] = None):
+    def __init__(self, ice_servers=None, initiator=False):
         super().__init__()
-        if not ice_servers:
-            self.ice_servers: List[IceServer] = []
-        elif all(isinstance(s, IceServer) for s in ice_servers):
-            self.ice_servers = ice_servers
-        elif all(isinstance(s, str) for s in ice_servers):
-            self.ice_servers = [IceServer(urls=s) for s in ice_servers]
-        else:
-            raise TypeError("ice_servers must be either List[str] or List[RTCIceServer]")
+        self.ice_servers = [
+            RTCIceServer(**s) if isinstance(s, dict) else RTCIceServer(urls=s)
+            for s in (ice_servers or [])
+        ]
         self._connect_invoked = False
         self._track_map = {}
         self._track_getters = {
             AUDIO_TRANSCEIVER_INDEX: self.audio_input_track,
             VIDEO_TRANSCEIVER_INDEX: self.video_input_track,
         }
+        self._initiator = initiator
+        self._offer = None
+        self._data_channel_name = "data"
 
         self._initialize()
 
@@ -123,6 +118,7 @@ class SmallWebRTCConnection(BaseObject):
         self._register_event_handler("closed")
         self._register_event_handler("failed")
         self._register_event_handler("new")
+        self._register_event_handler("offer-created")
 
     @property
     def pc(self) -> RTCPeerConnection:
@@ -136,7 +132,8 @@ class SmallWebRTCConnection(BaseObject):
         logger.debug("Initializing new peer connection")
         rtc_config = RTCConfiguration(iceServers=self.ice_servers)
 
-        self._answer: Optional[RTCSessionDescription] = None
+        self._answer = None
+        self._offer = None
         self._pc = RTCPeerConnection(rtc_config)
         self._pc_id = self.name
         self._setup_listeners()
@@ -146,33 +143,38 @@ class SmallWebRTCConnection(BaseObject):
         self._message_queue = []
 
     def _setup_listeners(self):
-        @self._pc.on("datachannel")
-        def on_datachannel(channel):
-            self._data_channel = channel
+        # Only set up datachannel listener when we're not the initiator
+        # When we're initiator, we create the data channel explicitly
+        if not self._initiator:
+            @self._pc.on("datachannel")
+            def on_datachannel(channel):
+                logger.debug(f"Data channel created: {channel}")
+                self._data_channel = channel
 
-            # Flush queued messages once the data channel is open
-            @channel.on("open")
-            async def on_open():
-                logger.debug("Data channel is open, flushing queued messages")
-                while self._message_queue:
-                    message = self._message_queue.pop(0)
-                    self._data_channel.send(message)
+                # Flush queued messages once the data channel is open
+                @channel.on("open")
+                async def on_open():
+                    logger.debug("Data channel is open, flushing queued messages")
+                    while self._message_queue:
+                        message = self._message_queue.pop(0)
+                        logger.debug(f"Sending message to data channel: {message}")
+                        self._data_channel.send(message)
 
-            @channel.on("message")
-            async def on_message(message):
-                try:
-                    # aiortc does not provide any way so we can be aware when we are disconnected,
-                    # so we are using this keep alive message as a way to implement that
-                    if isinstance(message, str) and message.startswith("ping"):
-                        self._last_received_time = time.time()
-                    else:
-                        json_message = json.loads(message)
-                        if json_message["type"] == SIGNALLING_TYPE and json_message.get("message"):
-                            self._handle_signalling_message(json_message["message"])
+                @channel.on("message")
+                async def on_message(message):
+                    try:
+                        # aiortc does not provide any way so we can be aware when we are disconnected,
+                        # so we are using this keep alive message as a way to implement that
+                        if isinstance(message, str) and message.startswith("ping"):
+                            self._last_received_time = time.time()
                         else:
-                            await self._call_event_handler("app-message", json_message)
-                except Exception as e:
-                    logger.exception(f"Error parsing JSON message {message}, {e}")
+                            json_message = json.loads(message)
+                            if json_message["type"] == SIGNALLING_TYPE and json_message.get("message"):
+                                self._handle_signalling_message(json_message["message"])
+                            else:
+                                await self._call_event_handler("app-message", json_message)
+                    except Exception as e:
+                        logger.exception(f"Error parsing JSON message {message}, {e}")
 
         # Despite the fact that aiortc provides this listener, they don't have a status for "disconnected"
         # So, in case we loose connection, this event will not be triggered
@@ -217,11 +219,51 @@ class SmallWebRTCConnection(BaseObject):
         logger.debug(f"Setting the answer after the local description is created")
         self._answer = self._pc.localDescription
 
+    def get_offer(self):
+        """
+        Return the generated offer when in initiator mode
+        """
+        if not self._offer:
+            return None
+
+        return {
+            "sdp": self._offer.sdp,
+            "type": self._offer.type,
+            "pc_id": self._pc_id,
+        }
+
     async def initialize(self, sdp: str, type: str):
+        """
+        Initialize the connection with remote SDP
+        In responder mode: set remote offer and create answer
+        In initiator mode: raises an exception (use create_offer instead)
+        
+        Raises:
+            ValueError: If called in initiator mode
+        """
+        if self._initiator:
+            raise ValueError("In initiator mode, use create_offer() instead of initialize()")
         await self._create_answer(sdp, type)
 
     async def connect(self):
+        """
+        Establish the connection
+        
+        In responder mode: connects using the previously initialized SDP
+        In initiator mode: requires an offer to have been created and an answer processed
+        
+        Raises:
+            RuntimeError: If called in initiator mode without a processed answer
+        """
         self._connect_invoked = True
+
+        # If initiator mode, we must have both offer and answer before connecting
+        if self._initiator:
+            if not self._offer:
+                raise RuntimeError("Cannot connect in initiator mode without creating an offer first")
+            if not self._answer:
+                raise RuntimeError("Cannot connect in initiator mode without processing an answer first")
+            
         # If we already connected, trigger again the connected event
         if self.is_connected():
             await self._call_event_handler("connected")
@@ -394,3 +436,92 @@ class SmallWebRTCConnection(BaseObject):
                 )()
                 if track:
                     track.set_enabled(signalling_message.enabled)
+            case PeerLeftMessage():
+                # Just log for now, actual disconnection is handled by caller
+                logger.debug("Received peer left message")
+            case RenegotiateMessage():
+                # Just log for now, actual renegotiation is handled elsewhere
+                logger.debug("Received renegotiation message")
+
+    async def create_offer(self):
+        """
+        Creates an SDP offer when in initiator mode.
+        Includes both data channel and audio/video transceivers.
+        
+        Returns:
+            dict: The SDP offer containing sdp, type and pc_id if successful
+            None: If not in initiator mode
+            
+        Raises:
+            RuntimeError: If offer creation fails
+        """
+        if not self._initiator:
+            raise RuntimeError("Attempted to create an offer while not in initiator mode")
+
+        # Create a data channel before generating the offer
+        # This ensures the SDP will include data channel information
+        self._data_channel = self._pc.createDataChannel(self._data_channel_name)
+        
+        # Set up the data channel event handlers
+        @self._data_channel.on("open")
+        async def on_open():
+            logger.debug("Data channel is open, flushing queued messages")
+            while self._message_queue:
+                message = self._message_queue.pop(0)
+                logger.debug(f"Flushing message to data channel: {message}")
+                self._data_channel.send(message)
+            
+                
+        @self._data_channel.on("message")
+        async def on_message(message):
+            logger.debug(f"Data channel message received: {message}")
+            try:
+                if isinstance(message, str) and message.startswith("ping"):
+                    self._last_received_time = time.time()
+                else:
+                    json_message = json.loads(message)
+                    if json_message["type"] == SIGNALLING_TYPE and json_message.get("message"):
+                        self._handle_signalling_message(json_message["message"])
+                    else:
+                        await self._call_event_handler("app-message", json_message)
+            except Exception as e:
+                logger.exception(f"Error parsing JSON message {message}, {e}")
+
+        # Add transceivers for audio and video
+        logger.debug("Adding audio transceivers")
+        self._pc.addTransceiver("audio", direction="sendrecv")
+        self._pc.addTransceiver("video", direction="sendrecv")
+
+        # Create offer
+        logger.debug("Creating offer as initiator")
+        try:
+            offer = await self._pc.createOffer()
+            await self._pc.setLocalDescription(offer)
+            self._offer = self._pc.localDescription
+            
+            # Notify that an offer has been created
+            await self._call_event_handler("offer-created", self.get_offer())
+            
+            return self.get_offer()
+        except Exception as e:
+            logger.exception("Failed to create offer")
+            raise RuntimeError(f"Failed to create offer: {str(e)}")
+
+    async def process_answer(self, sdp: str, type: str):
+        """
+        Process an SDP answer received in response to our offer
+        """
+        if not self._initiator:
+            logger.warning("Attempted to process an answer while not in initiator mode")
+            return
+
+        if not self._offer:
+            logger.warning("No offer has been created yet")
+            return
+
+        logger.debug("Processing answer as initiator")
+        self._answer = RTCSessionDescription(sdp=sdp, type=type)
+        await self._pc.setRemoteDescription(self._answer)
+        
+        # Force transceivers to sendrecv mode
+        self.force_transceivers_to_send_recv()
