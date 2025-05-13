@@ -7,7 +7,7 @@
 import asyncio
 import json
 import time
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, List
 
 from av.frame import Frame
 from loguru import logger
@@ -86,14 +86,23 @@ class SmallWebRTCTrack:
         # Forward other attribute/method calls to the underlying track
         return getattr(self._track, name)
 
+# Alias so we don't need to expose RTCIceServer
+IceServer = RTCIceServer
+
 
 class SmallWebRTCConnection(BaseObject):
     def __init__(self, ice_servers=None, initiator=False):
         super().__init__()
-        self.ice_servers = [
-            RTCIceServer(**s) if isinstance(s, dict) else RTCIceServer(urls=s)
-            for s in (ice_servers or [])
-        ]
+        if not ice_servers:
+            self.ice_servers: List[IceServer] = []
+        elif all(isinstance(s, IceServer) for s in ice_servers):
+            self.ice_servers = ice_servers
+        elif all(isinstance(s, str) for s in ice_servers):
+            self.ice_servers = [IceServer(urls=s) for s in ice_servers]
+        elif all(isinstance(s, dict) for s in ice_servers):
+            self.ice_servers = [IceServer(**s) for s in ice_servers]
+        else:
+            raise TypeError("ice_servers must be either List[str] or List[RTCIceServer]")
         self._connect_invoked = False
         self._track_map = {}
         self._track_getters = {
@@ -220,9 +229,7 @@ class SmallWebRTCConnection(BaseObject):
         self._answer = self._pc.localDescription
 
     def get_offer(self):
-        """
-        Return the generated offer when in initiator mode
-        """
+        """Return the generated offer when in initiator mode."""
         if not self._offer:
             return None
 
@@ -233,8 +240,8 @@ class SmallWebRTCConnection(BaseObject):
         }
 
     async def initialize(self, sdp: str, type: str):
-        """
-        Initialize the connection with remote SDP
+        """Initialize the connection with remote SDP.
+
         In responder mode: set remote offer and create answer
         In initiator mode: raises an exception (use create_offer instead)
         
@@ -242,12 +249,11 @@ class SmallWebRTCConnection(BaseObject):
             ValueError: If called in initiator mode
         """
         if self._initiator:
-            raise ValueError("In initiator mode, use create_offer() instead of initialize()")
+            raise RuntimeError("In initiator mode, use create_offer() instead of initialize()")
         await self._create_answer(sdp, type)
 
     async def connect(self):
-        """
-        Establish the connection
+        """Establish the connection.
         
         In responder mode: connects using the previously initialized SDP
         In initiator mode: requires an offer to have been created and an answer processed
@@ -444,14 +450,14 @@ class SmallWebRTCConnection(BaseObject):
                 logger.debug("Received renegotiation message")
 
     async def create_offer(self):
-        """
-        Creates an SDP offer when in initiator mode.
-        Includes both data channel and audio/video transceivers.
+        """Creates an SDP offer when in initiator mode.
         
+        Includes both data channel and audio/video transceivers.
+
         Returns:
             dict: The SDP offer containing sdp, type and pc_id if successful
             None: If not in initiator mode
-            
+
         Raises:
             RuntimeError: If offer creation fails
         """
@@ -461,7 +467,7 @@ class SmallWebRTCConnection(BaseObject):
         # Create a data channel before generating the offer
         # This ensures the SDP will include data channel information
         self._data_channel = self._pc.createDataChannel(self._data_channel_name)
-        
+
         # Set up the data channel event handlers
         @self._data_channel.on("open")
         async def on_open():
@@ -470,8 +476,8 @@ class SmallWebRTCConnection(BaseObject):
                 message = self._message_queue.pop(0)
                 logger.debug(f"Flushing message to data channel: {message}")
                 self._data_channel.send(message)
-            
-                
+
+
         @self._data_channel.on("message")
         async def on_message(message):
             logger.debug(f"Data channel message received: {message}")
@@ -498,19 +504,17 @@ class SmallWebRTCConnection(BaseObject):
             offer = await self._pc.createOffer()
             await self._pc.setLocalDescription(offer)
             self._offer = self._pc.localDescription
-            
+
             # Notify that an offer has been created
             await self._call_event_handler("offer-created", self.get_offer())
-            
+
             return self.get_offer()
         except Exception as e:
             logger.exception("Failed to create offer")
             raise RuntimeError(f"Failed to create offer: {str(e)}")
 
     async def process_answer(self, sdp: str, type: str):
-        """
-        Process an SDP answer received in response to our offer
-        """
+        """Process an SDP answer received in response to our offer."""
         if not self._initiator:
             logger.warning("Attempted to process an answer while not in initiator mode")
             return
@@ -522,6 +526,6 @@ class SmallWebRTCConnection(BaseObject):
         logger.debug("Processing answer as initiator")
         self._answer = RTCSessionDescription(sdp=sdp, type=type)
         await self._pc.setRemoteDescription(self._answer)
-        
+ 
         # Force transceivers to sendrecv mode
         self.force_transceivers_to_send_recv()
