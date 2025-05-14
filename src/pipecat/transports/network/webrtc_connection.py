@@ -86,12 +86,13 @@ class SmallWebRTCTrack:
         # Forward other attribute/method calls to the underlying track
         return getattr(self._track, name)
 
+
 # Alias so we don't need to expose RTCIceServer
 IceServer = RTCIceServer
 
 
 class SmallWebRTCConnection(BaseObject):
-    def __init__(self, ice_servers=None, initiator=False):
+    def __init__(self, ice_servers: Optional[List[Union[str, RTCIceServer]]] = None, initiator: bool = False):
         super().__init__()
         if not ice_servers:
             self.ice_servers: List[IceServer] = []
@@ -141,7 +142,7 @@ class SmallWebRTCConnection(BaseObject):
         logger.debug("Initializing new peer connection")
         rtc_config = RTCConfiguration(iceServers=self.ice_servers)
 
-        self._answer = None
+        self._answer: Optional[RTCSessionDescription] = None
         self._offer = None
         self._pc = RTCPeerConnection(rtc_config)
         self._pc_id = self.name
@@ -443,10 +444,8 @@ class SmallWebRTCConnection(BaseObject):
                 if track:
                     track.set_enabled(signalling_message.enabled)
             case PeerLeftMessage():
-                # Just log for now, actual disconnection is handled by caller
                 logger.debug("Received peer left message")
             case RenegotiateMessage():
-                # Just log for now, actual renegotiation is handled elsewhere
                 logger.debug("Received renegotiation message")
 
     async def create_offer(self):
