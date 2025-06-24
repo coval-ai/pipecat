@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
 from pipecat.services.stt_service import SegmentedSTTService, STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
+from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
     import riva.client
@@ -98,10 +99,13 @@ class RivaSTTService(STTService):
             "model_name": "parakeet-ctc-1.1b-asr",
         },
         sample_rate: Optional[int] = None,
-        params: InputParams = InputParams(),
+        params: Optional[InputParams] = None,
         **kwargs,
     ):
         super().__init__(sample_rate=sample_rate, **kwargs)
+
+        params = params or RivaSTTService.InputParams()
+
         self._api_key = api_key
         self._profanity_filter = False
         self._automatic_punctuation = True
@@ -117,6 +121,15 @@ class RivaSTTService(STTService):
         self._stop_threshold_eou = -1.0
         self._custom_configuration = ""
         self._function_id = model_function_map.get("function_id")
+
+        self._settings = {
+            "language": str(params.language),
+            "profanity_filter": self._profanity_filter,
+            "automatic_punctuation": self._automatic_punctuation,
+            "verbatim_transcripts": not self._no_verbatim_transcripts,
+            "boosted_lm_words": self._boosted_lm_words,
+            "boosted_lm_score": self._boosted_lm_score,
+        }
 
         self.set_model_name(model_function_map.get("model_name"))
 
@@ -211,11 +224,13 @@ class RivaSTTService(STTService):
             streaming_config=self._config,
         )
         for response in responses:
+            self.start_watchdog()
             if not response.results:
                 continue
             asyncio.run_coroutine_threadsafe(
                 self._response_queue.put(response), self.get_event_loop()
             )
+            self.reset_watchdog()
 
     async def _thread_task_handler(self):
         try:
@@ -224,6 +239,13 @@ class RivaSTTService(STTService):
         except asyncio.CancelledError:
             self._thread_running = False
             raise
+
+    @traced_stt
+    async def _handle_transcription(
+        self, transcript: str, is_final: bool, language: Optional[Language] = None
+    ):
+        """Handle a transcription result with tracing."""
+        pass
 
     async def _handle_response(self, response):
         for result in response.results:
@@ -236,19 +258,40 @@ class RivaSTTService(STTService):
                 if result.is_final:
                     await self.stop_processing_metrics()
                     await self.push_frame(
-                        TranscriptionFrame(transcript, "", time_now_iso8601(), None)
+                        TranscriptionFrame(
+                            transcript,
+                            "",
+                            time_now_iso8601(),
+                            self._language_code,
+                            result=result,
+                        )
+                    )
+                    await self._handle_transcription(
+                        transcript=transcript,
+                        is_final=result.is_final,
+                        language=self._language_code,
                     )
                 else:
                     await self.push_frame(
-                        InterimTranscriptionFrame(transcript, "", time_now_iso8601(), None)
+                        InterimTranscriptionFrame(
+                            transcript,
+                            "",
+                            time_now_iso8601(),
+                            self._language_code,
+                            result=result,
+                        )
                     )
 
     async def _response_task_handler(self):
         while True:
             response = await self._response_queue.get()
+            self.start_watchdog()
             await self._handle_response(response)
+            self.reset_watchdog()
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+        await self.start_ttfb_metrics()
+        await self.start_processing_metrics()
         await self._queue.put(audio)
         yield None
 
@@ -296,10 +339,12 @@ class RivaSegmentedSTTService(SegmentedSTTService):
             "model_name": "canary-1b-asr",
         },
         sample_rate: Optional[int] = None,
-        params: InputParams = InputParams(),
+        params: Optional[InputParams] = None,
         **kwargs,
     ):
         super().__init__(sample_rate=sample_rate, **kwargs)
+
+        params = params or RivaSegmentedSTTService.InputParams()
 
         # Set model name
         self.set_model_name(model_function_map.get("model_name"))
@@ -418,6 +463,11 @@ class RivaSegmentedSTTService(SegmentedSTTService):
         if self._config:
             self._config.language_code = self._language
 
+    @traced_stt
+    async def _handle_transcription(self, transcript: str, language: Optional[Language] = None):
+        """Handle a transcription result with tracing."""
+        pass
+
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         """Transcribe an audio segment.
 
@@ -475,6 +525,8 @@ class RivaSegmentedSTTService(SegmentedSTTService):
                             )
                             transcription_found = True
 
+                            await self._handle_transcription(text, True, self._language_enum)
+
                 if not transcription_found:
                     logger.debug("No transcription results found in Riva response")
 
@@ -500,7 +552,7 @@ class ParakeetSTTService(RivaSTTService):
             "model_name": "parakeet-ctc-1.1b-asr",
         },
         sample_rate: Optional[int] = None,
-        params: RivaSTTService.InputParams = RivaSTTService.InputParams(),  # Use parent class's type
+        params: Optional[RivaSTTService.InputParams] = None,  # Use parent class's type
         **kwargs,
     ):
         super().__init__(

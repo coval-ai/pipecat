@@ -9,7 +9,6 @@ import json
 import time
 from typing import Any, Literal, Optional, Union, List
 
-from av.frame import Frame
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 
@@ -24,6 +23,7 @@ try:
         RTCSessionDescription,
     )
     from aiortc.rtcrtpreceiver import RemoteStreamTrack
+    from av.frame import Frame
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use the SmallWebRTC, you need to `pip install pipecat-ai[webrtc]`.")
@@ -49,7 +49,9 @@ class PeerLeftMessage(BaseModel):
 
 
 class SignallingMessage:
-    Inbound = Union[TrackStatusMessage, RenegotiateMessage, PeerLeftMessage]  # in case we need to add new messages in the future
+    Inbound = Union[
+        TrackStatusMessage, RenegotiateMessage, PeerLeftMessage
+    ]  # in case we need to add new messages in the future
     outbound = Union[RenegotiateMessage, PeerLeftMessage]
 
 
@@ -92,7 +94,9 @@ IceServer = RTCIceServer
 
 
 class SmallWebRTCConnection(BaseObject):
-    def __init__(self, ice_servers: Optional[List[Union[str, RTCIceServer]]] = None, initiator: bool = False):
+    def __init__(
+        self, ice_servers: Optional[List[Union[str, RTCIceServer]]] = None, initiator: bool = False
+    ):
         super().__init__()
         if not ice_servers:
             self.ice_servers: List[IceServer] = []
@@ -151,11 +155,13 @@ class SmallWebRTCConnection(BaseObject):
         self._renegotiation_in_progress = False
         self._last_received_time = None
         self._message_queue = []
+        self._pending_app_messages = []
 
     def _setup_listeners(self):
         # Only set up datachannel listener when we're not the initiator
         # When we're initiator, we create the data channel explicitly
         if not self._initiator:
+
             @self._pc.on("datachannel")
             def on_datachannel(channel):
                 logger.debug(f"Data channel created: {channel}")
@@ -178,11 +184,11 @@ class SmallWebRTCConnection(BaseObject):
                         if isinstance(message, str) and message.startswith("ping"):
                             self._last_received_time = time.time()
                         else:
-                            json_message = json.loads(message)
-                            if json_message["type"] == SIGNALLING_TYPE and json_message.get("message"):
-                                self._handle_signalling_message(json_message["message"])
-                            else:
+                            if self.is_connected():
                                 await self._call_event_handler("app-message", json_message)
+                            else:
+                                logger.debug("Client not connected. Queuing app-message.")
+                                self._pending_app_messages.append(json_message)
                     except Exception as e:
                         logger.exception(f"Error parsing JSON message {message}, {e}")
 
@@ -245,7 +251,7 @@ class SmallWebRTCConnection(BaseObject):
 
         In responder mode: set remote offer and create answer
         In initiator mode: raises an exception (use create_offer instead)
-        
+
         Raises:
             ValueError: If called in initiator mode
         """
@@ -255,10 +261,10 @@ class SmallWebRTCConnection(BaseObject):
 
     async def connect(self):
         """Establish the connection.
-        
+
         In responder mode: connects using the previously initialized SDP
         In initiator mode: requires an offer to have been created and an answer processed
-        
+
         Raises:
             RuntimeError: If called in initiator mode without a processed answer
         """
@@ -267,13 +273,20 @@ class SmallWebRTCConnection(BaseObject):
         # If initiator mode, we must have both offer and answer before connecting
         if self._initiator:
             if not self._offer:
-                raise RuntimeError("Cannot connect in initiator mode without creating an offer first")
+                raise RuntimeError(
+                    "Cannot connect in initiator mode without creating an offer first"
+                )
             if not self._answer:
-                raise RuntimeError("Cannot connect in initiator mode without processing an answer first")
-            
+                raise RuntimeError(
+                    "Cannot connect in initiator mode without processing an answer first"
+                )
+
         # If we already connected, trigger again the connected event
         if self.is_connected():
             await self._call_event_handler("connected")
+            logger.debug("Flushing pending app-messages")
+            for message in self._pending_app_messages:
+                await self._call_event_handler("app-message", message)
             # We are renegotiating here, because likely we have loose the first video frames
             # and aiortc does not handle that pretty well.
             video_input_track = self.video_input_track()
@@ -342,6 +355,7 @@ class SmallWebRTCConnection(BaseObject):
         if self._pc:
             await self._pc.close()
         self._message_queue.clear()
+        self._pending_app_messages.clear()
         self._track_map = {}
 
     def get_answer(self):
@@ -450,7 +464,7 @@ class SmallWebRTCConnection(BaseObject):
 
     async def create_offer(self):
         """Creates an SDP offer when in initiator mode.
-        
+
         Includes both data channel and audio/video transceivers.
 
         Returns:
@@ -475,7 +489,6 @@ class SmallWebRTCConnection(BaseObject):
                 message = self._message_queue.pop(0)
                 logger.debug(f"Flushing message to data channel: {message}")
                 self._data_channel.send(message)
-
 
         @self._data_channel.on("message")
         async def on_message(message):
@@ -525,6 +538,6 @@ class SmallWebRTCConnection(BaseObject):
         logger.debug("Processing answer as initiator")
         self._answer = RTCSessionDescription(sdp=sdp, type=type)
         await self._pc.setRemoteDescription(self._answer)
- 
+
         # Force transceivers to sendrecv mode
         self.force_transceivers_to_send_recv()

@@ -26,6 +26,7 @@ from pipecat.services.aws.utils import build_event_message, decode_event, get_pr
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
+from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
     import websockets
@@ -265,8 +266,15 @@ class AWSTranscribeSTTService(STTService):
             Language.JA: "ja-JP",
             Language.KO: "ko-KR",
             Language.ZH: "zh-CN",
+            Language.PL: "pl-PL",
         }
         return language_map.get(language)
+
+    @traced_stt
+    async def _handle_transcription(
+        self, transcript: str, is_final: bool, language: Optional[str] = None
+    ):
+        pass
 
     async def _receive_loop(self):
         """Background task to receive and process messages from AWS Transcribe."""
@@ -277,6 +285,9 @@ class AWSTranscribeSTTService(STTService):
 
             try:
                 response = await self._ws_client.recv()
+
+                self.start_watchdog()
+
                 headers, payload = decode_event(response)
 
                 if headers.get(":message-type") == "event":
@@ -298,7 +309,13 @@ class AWSTranscribeSTTService(STTService):
                                             "",
                                             time_now_iso8601(),
                                             self._settings["language"],
+                                            result=result,
                                         )
+                                    )
+                                    await self._handle_transcription(
+                                        transcript,
+                                        is_final,
+                                        self._settings["language"],
                                     )
                                     await self.stop_processing_metrics()
                                 else:
@@ -308,6 +325,7 @@ class AWSTranscribeSTTService(STTService):
                                             "",
                                             time_now_iso8601(),
                                             self._settings["language"],
+                                            result=result,
                                         )
                                     )
                 elif headers.get(":message-type") == "exception":
@@ -327,3 +345,5 @@ class AWSTranscribeSTTService(STTService):
             except Exception as e:
                 logger.error(f"{self} Unexpected error in receive loop: {e}")
                 break
+            finally:
+                self.reset_watchdog()

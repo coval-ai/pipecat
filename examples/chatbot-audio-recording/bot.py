@@ -128,7 +128,15 @@ async def main():
             ]
         )
 
-        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                audio_in_sample_rate=16000,
+                audio_out_sample_rate=16000,
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
+        )
 
         @audiobuffer.event_handler("on_audio_data")
         async def on_audio_data(buffer, audio, sample_rate, num_channels):

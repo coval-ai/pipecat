@@ -42,11 +42,12 @@ from pipecat.processors.aggregators.openai_llm_context import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchResponseFrame
-from pipecat.services.llm_service import LLMService
+from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.openai.llm import (
     OpenAIAssistantContextAggregator,
     OpenAIUserContextAggregator,
 )
+from pipecat.utils.tracing.service_decorators import traced_llm
 
 # Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
@@ -82,7 +83,7 @@ class GoogleUserContextAggregator(OpenAIUserContextAggregator):
             await self.push_frame(frame)
 
             # Reset our accumulator state.
-            self.reset()
+            await self.reset()
 
 
 class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
@@ -366,7 +367,7 @@ class GoogleLLMContext(OpenAILLMContext):
                     }
                 )
             elif part.function_call:
-                args = type(part.function_call).to_dict(part.function_call).get("args", {})
+                args = part.function_call.args if hasattr(part.function_call, "args") else {}
                 msg["tool_calls"] = [
                     {
                         "id": part.function_call.name,
@@ -381,7 +382,9 @@ class GoogleLLMContext(OpenAILLMContext):
             elif part.function_response:
                 msg["role"] = "tool"
                 resp = (
-                    type(part.function_response).to_dict(part.function_response).get("response", {})
+                    part.function_response.response
+                    if hasattr(part.function_response, "response")
+                    else {}
                 )
                 msg["tool_call_id"] = part.function_response.name
                 msg["content"] = json.dumps(resp)
@@ -466,13 +469,16 @@ class GoogleLLMService(LLMService):
         *,
         api_key: str,
         model: str = "gemini-2.0-flash",
-        params: InputParams = InputParams(),
+        params: Optional[InputParams] = None,
         system_instruction: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        params = params or GoogleLLMService.InputParams()
+
         self.set_model_name(model)
         self._api_key = api_key
         self._system_instruction = system_instruction
@@ -493,6 +499,7 @@ class GoogleLLMService(LLMService):
     def _create_client(self, api_key: str):
         self._client = genai.Client(api_key=api_key)
 
+    @traced_llm
     async def _process_context(self, context: OpenAILLMContext):
         await self.push_frame(LLMFullResponseStartFrame())
 
@@ -548,9 +555,11 @@ class GoogleLLMService(LLMService):
                 contents=messages,
                 config=generation_config,
             )
-            await self.stop_ttfb_metrics()
 
+            function_calls = []
             async for chunk in response:
+                # Stop TTFB metrics after the first chunk
+                await self.stop_ttfb_metrics()
                 if chunk.usage_metadata:
                     prompt_tokens += chunk.usage_metadata.prompt_token_count or 0
                     completion_tokens += chunk.usage_metadata.candidates_token_count or 0
@@ -569,11 +578,13 @@ class GoogleLLMService(LLMService):
                                 function_call = part.function_call
                                 id = function_call.id or str(uuid.uuid4())
                                 logger.debug(f"Function call: {function_call.name}:{id}")
-                                await self.call_function(
-                                    context=context,
-                                    tool_call_id=id,
-                                    function_name=function_call.name,
-                                    arguments=function_call.args or {},
+                                function_calls.append(
+                                    FunctionCallFromLLM(
+                                        context=context,
+                                        tool_call_id=id,
+                                        function_name=function_call.name,
+                                        arguments=function_call.args or {},
+                                    )
                                 )
 
                     if (
@@ -614,6 +625,8 @@ class GoogleLLMService(LLMService):
                             "rendered_content": rendered_content,
                             "origins": origins,
                         }
+
+            await self.run_function_calls(function_calls)
         except DeadlineExceeded:
             await self._call_event_handler("on_completion_timeout")
         except Exception as e:

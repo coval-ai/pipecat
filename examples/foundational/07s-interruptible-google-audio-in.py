@@ -8,8 +8,8 @@ import argparse
 import os
 from dataclasses import dataclass
 
-import google.ai.generativelanguage as glm
 from dotenv import load_dotenv
+from google.genai.types import Content, Part
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -32,9 +32,9 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.transcriptions.language import Language
-from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
@@ -164,9 +164,7 @@ class TanscriptionContextFixup(FrameProcessor):
             and last_part.inline_data
             and last_part.inline_data.mime_type == "audio/wav"
         ):
-            self._context.messages[-2] = glm.Content(
-                role="user", parts=[glm.Part(text=self._transcript)]
-            )
+            self._context.messages[-2] = Content(role="user", parts=[Part(text=self._transcript)])
 
     def add_transcript_back_to_inference_output(self):
         if not self._transcript:
@@ -191,17 +189,30 @@ class TanscriptionContextFixup(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespace):
-    logger.info(f"Starting bot")
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+}
 
-    transport = SmallWebRTCTransport(
-        webrtc_connection=webrtc_connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
-    )
+
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+    logger.info(f"Starting bot")
 
     llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"), model="gemini-2.0-flash-001")
 
@@ -245,7 +256,6 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespac
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
@@ -261,18 +271,14 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespac
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-
-    @transport.event_handler("on_client_closed")
-    async def on_client_closed(transport, client):
-        logger.info(f"Client closed connection")
         await task.cancel()
 
-    runner = PipelineRunner(handle_sigint=False)
+    runner = PipelineRunner(handle_sigint=handle_sigint)
 
     await runner.run(task)
 
 
 if __name__ == "__main__":
-    from run import main
+    from pipecat.examples.run import main
 
-    main()
+    main(run_example, transport_params=transport_params)

@@ -20,7 +20,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.pipeline.base_pipeline import BasePipeline
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 
 
 class ParallelPipelineSource(FrameProcessor):
@@ -118,6 +118,12 @@ class ParallelPipeline(BasePipeline):
     # Frame processor
     #
 
+    async def setup(self, setup: FrameProcessorSetup):
+        await super().setup(setup)
+        await asyncio.gather(*[s.setup(setup) for s in self._sources])
+        await asyncio.gather(*[p.setup(setup) for p in self._pipelines])
+        await asyncio.gather(*[s.setup(setup) for s in self._sinks])
+
     async def cleanup(self):
         await super().cleanup()
         await asyncio.gather(*[s.cleanup() for s in self._sources])
@@ -196,13 +202,17 @@ class ParallelPipeline(BasePipeline):
     async def _process_up_queue(self):
         while True:
             frame = await self._up_queue.get()
+            self.start_watchdog()
             await self._parallel_push_frame(frame, FrameDirection.UPSTREAM)
             self._up_queue.task_done()
+            self.reset_watchdog()
 
     async def _process_down_queue(self):
         running = True
         while running:
             frame = await self._down_queue.get()
+
+            self.start_watchdog()
 
             endframe_counter = self._endframe_counter.get(frame.id, 0)
 
@@ -218,3 +228,5 @@ class ParallelPipeline(BasePipeline):
             running = not (endframe_counter == 0 and isinstance(frame, EndFrame))
 
             self._down_queue.task_done()
+
+            self.reset_watchdog()

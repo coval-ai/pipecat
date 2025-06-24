@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallFromLLM,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
     LLMFullResponseEndFrame,
@@ -142,7 +143,7 @@ class AWSNovaSonicLLMService(LLMService):
         region: str,
         model: str = "amazon.nova-sonic-v1:0",
         voice_id: str = "matthew",  # matthew, tiffany, amy
-        params: Params = Params(),
+        params: Optional[Params] = None,
         system_instruction: Optional[str] = None,
         tools: Optional[ToolsSchema] = None,
         send_transcription_frames: bool = True,
@@ -155,7 +156,7 @@ class AWSNovaSonicLLMService(LLMService):
         self._model = model
         self._client: Optional[BedrockRuntimeClient] = None
         self._voice_id = voice_id
-        self._params = params
+        self._params = params or Params()
         self._system_instruction = system_instruction
         self._tools = tools
         self._send_transcription_frames = send_transcription_frames
@@ -698,6 +699,8 @@ class AWSNovaSonicLLMService(LLMService):
                 output = await self._stream.await_output()
                 result = await output[1].receive()
 
+                self.start_watchdog()
+
                 if result.value and result.value.bytes_:
                     response_data = result.value.bytes_.decode("utf-8")
                     json_data = json.loads(response_data)
@@ -730,6 +733,8 @@ class AWSNovaSonicLLMService(LLMService):
             logger.error(f"{self} error processing responses: {e}")
             if self._wants_connection:
                 await self.reset_conversation()
+        finally:
+            self.reset_watchdog()
 
     async def _handle_completion_start_event(self, event_json):
         pass
@@ -804,12 +809,16 @@ class AWSNovaSonicLLMService(LLMService):
         # Call tool function
         if self.has_function(function_name):
             if function_name in self._functions.keys() or None in self._functions.keys():
-                await self.call_function(
-                    context=self._context,
-                    tool_call_id=tool_call_id,
-                    function_name=function_name,
-                    arguments=arguments,
-                )
+                function_calls_llm = [
+                    FunctionCallFromLLM(
+                        context=self._context,
+                        tool_call_id=tool_call_id,
+                        function_name=function_name,
+                        arguments=arguments,
+                    )
+                ]
+
+                await self.run_function_calls(function_calls_llm)
         else:
             raise AWSNovaSonicUnhandledFunctionException(
                 f"The LLM tried to call a function named '{function_name}', but there isn't a callback registered for that function."
