@@ -22,12 +22,16 @@ from loguru import logger
 
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.coval_webrtc import LocalCovalDailyTransport
 from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
 from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import IceServer, SmallWebRTCConnection
+from pipecat.transports.network.webrtc_connection import (
+    IceServer,
+    SmallWebRTCConnection,
+)
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 
 # Load environment variables
@@ -211,6 +215,43 @@ def run_example_twilio(
     uvicorn.run(app, host=args.host, port=args.port)
 
 
+def run_example_coval(
+    run_example: Callable,
+    args: argparse.Namespace,
+    transport_params: Mapping[str, Callable] = {},
+):
+    logger.info("Running example with LocalCovalDailyTransport...")
+
+    async def run():
+        # Get API key from environment
+        coval_api_key = os.getenv("COVAL_API_KEY")
+        if not coval_api_key:
+            logger.error("COVAL_API_KEY environment variable is not set.")
+            return
+
+        # Load evaluation config from JSON string argument
+        if not args.coval_eval_config:
+            logger.error("--coval-eval-config argument is required for coval transport.")
+            return
+        try:
+            evaluation_config = json.loads(args.coval_eval_config)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON from --coval-eval-config: {e}")
+            logger.error(f"Received: {args.coval_eval_config}")
+            return
+
+        params: TransportParams = transport_params[args.transport]()
+        transport = LocalCovalDailyTransport(
+            params=params,
+            api_key=coval_api_key,
+            evaluation_config=evaluation_config,
+        )
+
+        await run_example(transport, args, True)
+
+    asyncio.run(run())
+
+
 def run_main(
     run_example: Callable,
     args: argparse.Namespace,
@@ -227,6 +268,8 @@ def run_main(
             run_example_webrtc(run_example, args, transport_params)
         case "twilio":
             run_example_twilio(run_example, args, transport_params)
+        case "coval":
+            run_example_coval(run_example, args, transport_params)
 
 
 def main(
@@ -247,9 +290,14 @@ def main(
         "--transport",
         "-t",
         type=str,
-        choices=["daily", "webrtc", "twilio"],
+        choices=["daily", "webrtc", "twilio", "coval"],
         default="webrtc",
         help="The transport this example should use",
+    )
+    parser.add_argument(
+        "--coval-eval-config",
+        type=str,
+        help="A JSON string with the evaluation configuration for the Coval transport.",
     )
     parser.add_argument(
         "--proxy", "-x", help="A public proxy host name (no protocol, e.g. proxy.example.com)"
